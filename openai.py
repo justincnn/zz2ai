@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -219,6 +220,90 @@ class Toolify:
 
         return parsed
 
+    @staticmethod
+    def extract_forced_tool_name(tool_choice: object) -> str | None:
+        if isinstance(tool_choice, str):
+            if tool_choice in {"auto", "none", "required"}:
+                return None
+            return tool_choice or None
+
+        if isinstance(tool_choice, dict):
+            if tool_choice.get("type") == "function":
+                fn = tool_choice.get("function")
+                if isinstance(fn, dict):
+                    name = fn.get("name")
+                    if isinstance(name, str) and name.strip():
+                        return name.strip()
+
+        return None
+
+    @staticmethod
+    def _extract_text_arg(prompt: str) -> str:
+        if not prompt:
+            return ""
+
+        quoted = re.search(r"[\"“'`](.*?)[\"”'`]", prompt)
+        if quoted and quoted.group(1).strip():
+            return quoted.group(1).strip()
+
+        named = re.search(
+            r"text\s*(?:设为|设置为|为|=|:|：)?\s*([\w\-\u4e00-\u9fff]+)",
+            prompt,
+            flags=re.IGNORECASE,
+        )
+        if named and named.group(1).strip():
+            return named.group(1).strip()
+
+        tail = re.search(r"([\w\-\u4e00-\u9fff]+)\s*$", prompt)
+        if tail and tail.group(1).strip():
+            return tail.group(1).strip()
+
+        return prompt.strip()
+
+    @staticmethod
+    def build_forced_tool_call(
+        tools: list[dict] | None,
+        tool_choice: object,
+        prompt: str,
+    ) -> dict | None:
+        forced_name = Toolify.extract_forced_tool_name(tool_choice)
+        if not forced_name:
+            return None
+
+        selected: dict | None = None
+        for tool in tools or []:
+            fn = tool.get("function", {}) if isinstance(tool, dict) else {}
+            if isinstance(fn, dict) and fn.get("name") == forced_name:
+                selected = tool
+                break
+
+        if not selected:
+            return None
+
+        fn = selected.get("function", {}) if isinstance(selected, dict) else {}
+        params = fn.get("parameters", {}) if isinstance(fn, dict) else {}
+        props = params.get("properties", {}) if isinstance(params, dict) else {}
+        required = params.get("required", []) if isinstance(params, dict) else []
+
+        arg_value = Toolify._extract_text_arg(prompt)
+        arguments_obj: dict = {}
+
+        if isinstance(props, dict) and "text" in props:
+            arguments_obj["text"] = arg_value
+        elif isinstance(required, list) and required:
+            first_key = required[0]
+            if isinstance(first_key, str) and first_key:
+                arguments_obj[first_key] = arg_value
+
+        return {
+            "id": f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "function": {
+                "name": forced_name,
+                "arguments": json.dumps(arguments_obj, ensure_ascii=False),
+            },
+        }
+
 
 def _make_id() -> str:
     return f"chatcmpl-{uuid.uuid4().hex[:29]}"
@@ -281,6 +366,55 @@ def _openai_completion(
     }
 
 
+async def _forced_stream_response(
+    completion_id: str,
+    model: str,
+    forced_tc: dict,
+):
+    role_chunk = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"role": "assistant"},
+                "finish_reason": None,
+            }
+        ],
+    }
+    yield f"data: {json.dumps(role_chunk, ensure_ascii=False)}\n\n"
+
+    tc_chunk = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": forced_tc["id"],
+                            "type": "function",
+                            "function": forced_tc["function"],
+                        }
+                    ]
+                },
+                "finish_reason": None,
+            }
+        ],
+    }
+    yield f"data: {json.dumps(tc_chunk, ensure_ascii=False)}\n\n"
+
+    finish_chunk = _openai_chunk(completion_id, model, finish_reason="tool_calls")
+    yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n"
+    yield "data: [DONE]\n\n"
+
+
 # ── /v1/models ───────────────────────────────────────────────────────
 
 
@@ -339,6 +473,7 @@ async def _stream_response(
     model: str,
     prompt: str,
     tools: list[dict] | None = None,
+    tool_choice: object = None,
 ):
     """SSE generator with one retry on error."""
     completion_id = _make_id()
@@ -408,6 +543,33 @@ async def _stream_response(
                 elif phase == "done":
                     break
 
+            forced_tc = Toolify.build_forced_tool_call(tools, tool_choice, prompt)
+            if tool_call_idx == 0 and forced_tc:
+                tc_chunk = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": forced_tc["id"],
+                                        "type": "function",
+                                        "function": forced_tc["function"],
+                                    }
+                                ]
+                            },
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+                yield f"data: {json.dumps(tc_chunk, ensure_ascii=False)}\n\n"
+                tool_call_idx = 1
+
             # Send finish chunk
             finish_reason = "tool_calls" if tool_call_idx > 0 else "stop"
             finish_chunk = _openai_chunk(
@@ -439,6 +601,7 @@ async def _sync_response(
     model: str,
     prompt: str,
     tools: list[dict] | None = None,
+    tool_choice: object = None,
 ) -> dict:
     """Non-streaming response with one retry on error."""
     completion_id = _make_id()
@@ -465,8 +628,13 @@ async def _sync_response(
                 elif phase == "done":
                     break
 
+            forced_tc = Toolify.build_forced_tool_call(tools, tool_choice, prompt)
+            if not tool_calls and forced_tc:
+                tool_calls.append(forced_tc)
+
             if tool_calls:
                 message: dict = {"role": "assistant", "content": None, "tool_calls": tool_calls}
+                message["function_call"] = tool_calls[0]["function"]
                 if reasoning_parts:
                     message["reasoning_content"] = "".join(reasoning_parts)
                 return {
@@ -518,9 +686,50 @@ async def chat_completions(request: Request):
     messages: list[dict] = body.get("messages", [])
     stream: bool = body.get("stream", False)
     tools: list[dict] | None = Toolify.normalize_tools(body.get("tools"))
+    tool_choice = body.get("tool_choice")
 
     # 通过 Toolify 统一抽取 prompt 与上下文扁平化，支持 tool / tool_calls 消息
     prompt = Toolify.extract_prompt(messages)
+
+    forced_tc = Toolify.build_forced_tool_call(tools, tool_choice, prompt)
+    if forced_tc:
+        completion_id = _make_id()
+        if stream:
+            return StreamingResponse(
+                _forced_stream_response(completion_id, model, forced_tc),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
+        message: dict = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [forced_tc],
+            "function_call": forced_tc["function"],
+        }
+        return {
+            "id": completion_id,
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": message,
+                    "finish_reason": "tool_calls",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            },
+        }
+
     messages = Toolify.flatten_messages(messages)
 
     if not prompt:
@@ -536,7 +745,7 @@ async def chat_completions(request: Request):
 
     if stream:
         return StreamingResponse(
-            _stream_response(messages, model, prompt, tools),
+            _stream_response(messages, model, prompt, tools, tool_choice),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -545,7 +754,7 @@ async def chat_completions(request: Request):
             },
         )
     else:
-        result = await _sync_response(messages, model, prompt, tools)
+        result = await _sync_response(messages, model, prompt, tools, tool_choice)
         if "error" in result:
             return JSONResponse(status_code=502, content=result)
         return result
